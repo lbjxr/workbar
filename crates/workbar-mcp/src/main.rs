@@ -11,7 +11,10 @@ use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::sync::OnceLock;
 
-use workbar_core::{normalize_task, parse_hhmm, Plan, Task, TimerMode};
+use workbar_core::{
+    normalize_task, parse_hhmm, Plan, Task, TimerMode, MAX_EST_MIN, MAX_NOTE_CHARS,
+    MAX_TASKS_PER_DAY, MAX_TITLE_CHARS,
+};
 
 const SERVER_NAME: &str = "workbar";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -164,7 +167,8 @@ fn task_schema() -> Value {
         "properties": {
             "title": {
                 "type": "string",
-                "description": "Short task title shown on the bar (<= 14 Chinese characters)."
+                "maxLength": MAX_TITLE_CHARS,
+                "description": "Short task title shown on the bar (<= 14 Chinese characters; server rejects titles over 40 characters)."
             },
             "start": {
                 "type": "string",
@@ -179,7 +183,7 @@ fn task_schema() -> Value {
             "est_min": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 720,
+                "maximum": MAX_EST_MIN,
                 "description": "Planned minutes for a countdown task (defaults to end-start when both times are given, otherwise 25). Leave it out — together with start/end — to get an open-ended stopwatch task."
             },
             "timer": {
@@ -197,6 +201,7 @@ fn task_schema() -> Value {
             },
             "note": {
                 "type": "string",
+                "maxLength": MAX_NOTE_CHARS,
                 "description": "Optional one-line detail."
             }
         },
@@ -222,9 +227,10 @@ fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "title": {
                         "type": "string",
+                        "maxLength": MAX_TITLE_CHARS,
                         "description": "Short title of the work (3-8 Chinese chars / a few latin words)."
                     },
-                    "note": { "type": "string", "description": "Optional one-line detail." }
+                    "note": { "type": "string", "maxLength": MAX_NOTE_CHARS, "description": "Optional one-line detail." }
                 },
                 "required": ["title"],
                 "additionalProperties": false
@@ -252,7 +258,7 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "tasks": { "type": "array", "items": task_schema(), "minItems": 1 }
+                    "tasks": { "type": "array", "items": task_schema(), "minItems": 1, "maxItems": MAX_TASKS_PER_DAY }
                 },
                 "required": ["tasks"],
                 "additionalProperties": false
@@ -265,7 +271,7 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "tasks": { "type": "array", "items": task_schema(), "minItems": 1 },
+                    "tasks": { "type": "array", "items": task_schema(), "minItems": 1, "maxItems": MAX_TASKS_PER_DAY },
                     "position": { "type": "string", "enum": ["first", "last"], "description": "Explicitly insert this batch at the front or end. Omit to append. Cannot combine with after_id." },
                     "after_id": { "type": "string", "description": "Explicitly insert this batch after an existing task id. Cannot combine with position." }
                 },
@@ -281,16 +287,16 @@ fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "Task id from workbar_get_today." },
-                    "title": { "type": "string" },
+                    "title": { "type": "string", "maxLength": MAX_TITLE_CHARS },
                     "start": { "type": ["string", "null"], "description": "New start HH:mm, or null to clear." },
                     "end": { "type": ["string", "null"], "description": "New end HH:mm, or null to clear." },
-                    "est_min": { "type": "integer", "minimum": 1 },
+                    "est_min": { "type": "integer", "minimum": 1, "maximum": MAX_EST_MIN },
                     "timer": {
                         "type": "string",
                         "enum": ["down", "up"],
                         "description": "Switch the timer mode for this task. Ignored by 'up' tasks."
                     },
-                    "note": { "type": ["string", "null"] },
+                    "note": { "type": ["string", "null"], "maxLength": MAX_NOTE_CHARS },
                     "running": { "type": "boolean", "description": "Start or explicitly pause only this task's timer." },
                     "done": { "type": "boolean" },
                     "position": { "type": "string", "enum": ["first", "last"], "description": "Explicitly move this task to the front or end. Cannot combine with after_id." },
@@ -434,6 +440,34 @@ fn tool_get_today(_args: &Value) -> Value {
     }
 }
 
+/// Explicit rejection for *new* tasks, before `normalize_task` clamps
+/// them. Clamping alone would hide the problem from the AI client; an
+/// explicit error tells it exactly which field to fix and retry.
+fn validate_new_task(task: &Task, index: usize) -> Result<(), String> {
+    let label = format!("第 {} 个任务", index + 1);
+    let title_len = task.title.trim().chars().count();
+    if title_len > MAX_TITLE_CHARS {
+        return Err(format!(
+            "{label}标题过长：最多 {MAX_TITLE_CHARS} 个字符，收到 {title_len} 个"
+        ));
+    }
+    if task.est_min > MAX_EST_MIN {
+        return Err(format!(
+            "{label}的 est_min 过大：最大 {MAX_EST_MIN} 分钟，收到 {} 分钟",
+            task.est_min
+        ));
+    }
+    if let Some(note) = &task.note {
+        let note_len = note.trim().chars().count();
+        if note_len > MAX_NOTE_CHARS {
+            return Err(format!(
+                "{label}的 note 过长：最多 {MAX_NOTE_CHARS} 个字符，收到 {note_len} 个"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn parse_tasks(value: &Value) -> Result<Vec<Task>, String> {
     let items = value.as_array().ok_or_else(|| "tasks 必须是数组".to_string())?;
     if items.is_empty() {
@@ -443,6 +477,7 @@ fn parse_tasks(value: &Value) -> Result<Vec<Task>, String> {
     for (index, item) in items.iter().enumerate() {
         let mut task: Task = serde_json::from_value(item.clone())
             .map_err(|err| format!("第 {} 个任务格式错误：{err}", index + 1))?;
+        validate_new_task(&task, index)?;
         normalize_task(&mut task).map_err(|err| format!("第 {} 个任务无效：{err}", index + 1))?;
         tasks.push(task);
     }
@@ -590,6 +625,35 @@ fn tool_update_task(args: &Value) -> Value {
     if matches!(&placement, Some(Placement::After(after)) if after == &id) {
         return error_result("不能将任务放到它自己后面".into());
     }
+    // Validate only the fields actually supplied here. The stored task's
+    // existing values are not re-validated: an old over-long title must
+    // still be pausable/completable, and storage clamps it on this write.
+    if let Some(title) = args.get("title").and_then(Value::as_str) {
+        let len = title.trim().chars().count();
+        if len > MAX_TITLE_CHARS {
+            return error_result(format!(
+                "标题过长：最多 {MAX_TITLE_CHARS} 个字符，收到 {len} 个"
+            ));
+        }
+    }
+    if let Some(value) = args.get("est_min") {
+        let Some(value) = value.as_u64() else {
+            return error_result("est_min 必须是整数".into());
+        };
+        if value > MAX_EST_MIN as u64 {
+            return error_result(format!(
+                "est_min 过大：最大 {MAX_EST_MIN} 分钟，收到 {value} 分钟"
+            ));
+        }
+    }
+    if let Some(note) = args.get("note").and_then(Value::as_str) {
+        let len = note.trim().chars().count();
+        if len > MAX_NOTE_CHARS {
+            return error_result(format!(
+                "note 过长：最多 {MAX_NOTE_CHARS} 个字符，收到 {len} 个"
+            ));
+        }
+    }
     let result = workbar_core::update(|plan| {
         let task = plan
             .tasks
@@ -727,12 +791,26 @@ fn tool_start_work(args: &Value) -> Value {
         Some(title) => title.to_string(),
         None => return error_result("title 不能为空".to_string()),
     };
+    if title.chars().count() > MAX_TITLE_CHARS {
+        return error_result(format!(
+            "标题过长：最多 {MAX_TITLE_CHARS} 个字符，收到 {} 个",
+            title.chars().count()
+        ));
+    }
     let note = args
         .get("note")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    if let Some(note) = &note {
+        if note.chars().count() > MAX_NOTE_CHARS {
+            return error_result(format!(
+                "note 过长：最多 {MAX_NOTE_CHARS} 个字符，收到 {} 个",
+                note.chars().count()
+            ));
+        }
+    }
     let source = client_name();
     let mut task = Task {
             title,
@@ -895,6 +973,54 @@ mod tests {
         assert_eq!(tool_finish_work(&json!({}))["isError"], true);
         let plan = workbar_core::load().unwrap();
         assert_eq!(plan.tasks.iter().filter(|task| task.source.as_deref() == Some("independence-test") && !task.done).count(), 2);
+    }
+
+    #[test]
+    fn parse_tasks_rejects_overlong_new_input() {
+        let long_title = "x".repeat(MAX_TITLE_CHARS + 1);
+        let long_note = "n".repeat(MAX_NOTE_CHARS + 1);
+        assert!(parse_tasks(&json!([{ "title": long_title }])).is_err());
+        assert!(parse_tasks(&json!([{ "title": "ok", "est_min": MAX_EST_MIN + 1 }])).is_err());
+        assert!(parse_tasks(&json!([{ "title": "ok", "note": long_note }])).is_err());
+        // At the bounds, input is accepted.
+        assert!(parse_tasks(&json!([{
+            "title": "x".repeat(MAX_TITLE_CHARS),
+            "est_min": MAX_EST_MIN,
+            "note": "n".repeat(MAX_NOTE_CHARS),
+        }])).is_ok());
+    }
+
+    #[test]
+    fn tool_schemas_advertise_the_server_limits() {
+        let tools = tool_definitions();
+        let find = |name: &str| tools.iter().find(|tool| tool["name"] == name).unwrap();
+        let plan_day = find("workbar_plan_day");
+        assert_eq!(
+            plan_day["inputSchema"]["properties"]["tasks"]["maxItems"].as_u64(),
+            Some(MAX_TASKS_PER_DAY as u64)
+        );
+        let task_schema = &plan_day["inputSchema"]["properties"]["tasks"]["items"];
+        assert_eq!(
+            task_schema["properties"]["title"]["maxLength"].as_u64(),
+            Some(MAX_TITLE_CHARS as u64)
+        );
+        assert_eq!(
+            task_schema["properties"]["est_min"]["maximum"].as_u64(),
+            Some(MAX_EST_MIN as u64)
+        );
+        assert_eq!(
+            task_schema["properties"]["note"]["maxLength"].as_u64(),
+            Some(MAX_NOTE_CHARS as u64)
+        );
+        let update = find("workbar_update_task");
+        assert_eq!(
+            update["inputSchema"]["properties"]["est_min"]["maximum"].as_u64(),
+            Some(MAX_EST_MIN as u64)
+        );
+        assert_eq!(
+            update["inputSchema"]["properties"]["title"]["maxLength"].as_u64(),
+            Some(MAX_TITLE_CHARS as u64)
+        );
     }
 
     fn fs_create_directory(path: &std::path::Path) {

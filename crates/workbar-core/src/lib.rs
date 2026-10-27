@@ -11,6 +11,21 @@ pub use storage::{load, set_task_state, update, Store};
 pub const APP_DIR: &str = "Workbar";
 pub const DEFAULT_EST_MIN: u32 = 25;
 
+/// Server-side safety bounds. These are deliberately looser than the
+/// product guidance in the MCP tool descriptions (short titles, 3-8 tasks
+/// per day): they stop abuse and runaway plans without rejecting ordinary
+/// use. The MCP layer rejects over-limit *new* input explicitly; this
+/// layer clamps, so tasks stored before the bounds existed stay operable
+/// and are migrated on their next write instead of becoming unfinishable.
+pub const MAX_TITLE_CHARS: usize = 40;
+pub const MAX_NOTE_CHARS: usize = 200;
+pub const MAX_EST_MIN: u32 = 720;
+pub const MAX_TASKS_PER_DAY: usize = 100;
+
+fn truncate_chars(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -232,6 +247,24 @@ pub fn normalize_task(task: &mut Task) -> Result<(), String> {
         let trimmed = source.trim().to_string();
         task.source = if trimmed.is_empty() { None } else { Some(trimmed) };
     }
+    // Lenient migration path (see the MAX_* constants above): clamp values
+    // that were storable before the bounds existed, instead of rejecting
+    // the whole write and bricking an old task. New input is rejected
+    // explicitly by the MCP layer before it reaches here.
+    if task.title.chars().count() > MAX_TITLE_CHARS {
+        task.title = truncate_chars(&task.title, MAX_TITLE_CHARS);
+    }
+    if let Some(note) = &task.note {
+        if note.chars().count() > MAX_NOTE_CHARS {
+            task.note = Some(truncate_chars(note, MAX_NOTE_CHARS));
+        }
+    }
+    // Only an explicitly supplied estimate is clamped. A zero estimate is
+    // the "derive from the time window" sentinel, so this runs before the
+    // derivation below and a long window may legitimately derive past 720.
+    if task.est_min > MAX_EST_MIN {
+        task.est_min = MAX_EST_MIN;
+    }
     for (field, value) in [("start", &task.start), ("end", &task.end)] {
         if let Some(v) = value {
             if !is_hhmm(v) {
@@ -368,6 +401,37 @@ mod tests {
         normalize_task(&mut paused).unwrap();
         assert!(paused.paused);
         assert!(!paused.running);
+    }
+
+    #[test]
+    fn normalize_clamps_overlong_title_note_and_explicit_estimate() {
+        let mut task = Task {
+            title: "中".repeat(50),
+            est_min: 999_999,
+            note: Some("n".repeat(300)),
+            ..Task::default()
+        };
+        normalize_task(&mut task).unwrap();
+        assert_eq!(task.title.chars().count(), MAX_TITLE_CHARS);
+        assert_eq!(task.title, "中".repeat(MAX_TITLE_CHARS));
+        assert_eq!(task.est_min, MAX_EST_MIN);
+        assert_eq!(task.note.as_ref().unwrap().chars().count(), MAX_NOTE_CHARS);
+    }
+
+    #[test]
+    fn normalize_window_derived_estimate_is_not_clamped() {
+        // The cap applies to an explicitly supplied estimate. A zero
+        // estimate is the derive-from-window sentinel, so a 09:00-23:00
+        // window legitimately derives 840 minutes.
+        let mut task = Task {
+            title: "long day".into(),
+            start: Some("09:00".into()),
+            end: Some("23:00".into()),
+            ..Task::default()
+        };
+        normalize_task(&mut task).unwrap();
+        assert_eq!(task.est_min, 840);
+        assert_eq!(timer_mode(&task), TimerMode::Down);
     }
 
     #[test]

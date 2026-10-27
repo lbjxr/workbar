@@ -267,19 +267,22 @@ function independentClient(calls) {
     check('no plan.json is created', !fs.existsSync(path.join(dataDir, 'plan.json')));
     check('empty database still returns today', typeof raw.date === 'string' && raw.date.length === 10);
 
-    await call('workbar_plan_day', { tasks: Array.from({ length: 200 }, (_, index) => ({ title: `unrelated-${index}`, paused: true })) });
+    // Day cap is 100 tasks: 99 planned tasks + one work session fills it.
+    await call('workbar_plan_day', { tasks: Array.from({ length: 99 }, (_, index) => ({ title: `unrelated-${index}`, paused: true })) });
     const smallStart = await call('workbar_start_work', { title: 'compact-result' });
     const own = dataOf(smallStart);
-    check('start response contains only its new task even with 200 existing tasks', own.id && own.running && textOf(smallStart).length < 400 && !textOf(smallStart).includes('unrelated-'));
+    check('start response contains only its new task even with 99 existing tasks', own.id && own.running && textOf(smallStart).length < 400 && !textOf(smallStart).includes('unrelated-'));
     const smallFinish = await call('workbar_finish_work', { id: own.id });
     check('finish response contains only its completed task', dataOf(smallFinish).done && dataOf(smallFinish).id === own.id && textOf(smallFinish).length < 400 && !textOf(smallFinish).includes('unrelated-'));
-    const onlyAdded = await call('workbar_add_tasks', { tasks: [{ title: 'one-new-task' }] });
-    check('addition response contains only the added task', dataOf(onlyAdded).tasks.length === 1 && dataOf(onlyAdded).tasks[0].title === 'one-new-task');
+    await rejectsUnchanged('workbar_add_tasks', { tasks: [{ title: 'one-too-many' }] }, 'adding past the 100-task day cap leaves the plan untouched');
+    await rejectsUnchanged('workbar_plan_day', { tasks: Array.from({ length: 101 }, (_, index) => ({ title: `over-${index}` })) }, 'planning 101 tasks leaves the plan untouched');
     const onlyUpdated = await call('workbar_update_task', { id: own.id, title: 'renamed-session' });
     check('update response contains only the target task', dataOf(onlyUpdated).id === own.id && !textOf(onlyUpdated).includes('unrelated-'));
-    const removedId = dataOf(onlyAdded).tasks[0].id;
+    const removedId = idOf('unrelated-0');
     const removed = await call('workbar_remove_task', { id: removedId });
-    check('remove returns only its target id and deletes only that task', dataOf(removed).id === removedId && dataOf(removed).removed && latestPlan.tasks.length === 201 && !latestPlan.tasks.some((task) => task.id === removedId));
+    check('remove returns only its target id and deletes only that task', dataOf(removed).id === removedId && dataOf(removed).removed && latestPlan.tasks.length === 99 && !latestPlan.tasks.some((task) => task.id === removedId));
+    const onlyAdded = await call('workbar_add_tasks', { tasks: [{ title: 'one-new-task' }] });
+    check('addition response contains only the added task', dataOf(onlyAdded).tasks.length === 1 && dataOf(onlyAdded).tasks[0].title === 'one-new-task');
     await call('workbar_clear_day', {});
 
     const base = dataOf(await call('workbar_start_work', { title: 'parallel-base' }));

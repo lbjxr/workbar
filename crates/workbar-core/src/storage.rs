@@ -1,4 +1,4 @@
-use crate::{normalize_task, parse_hhmm, timer_mode, Plan, Task, TimerMode};
+use crate::{normalize_task, parse_hhmm, timer_mode, Plan, Task, TimerMode, MAX_TASKS_PER_DAY};
 use rusqlite::{params, Connection, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -141,6 +141,16 @@ impl Store {
         let before = Self::read(&tx, now, today)?;
         let mut plan = before.clone();
         mutate(&mut plan)?;
+        // Growth cap, not a retroactive purge: a plan that already exceeds
+        // the cap (stored before it existed) can still shrink, complete and
+        // reorder, but nothing may grow it further.
+        if plan.tasks.len() > MAX_TASKS_PER_DAY && plan.tasks.len() > before.tasks.len() {
+            return Err(format!(
+                "一天最多 {} 个任务，当前已有 {} 个，无法再增加任务",
+                MAX_TASKS_PER_DAY,
+                before.tasks.len()
+            ));
+        }
         let old: HashMap<_, _> = before.tasks.iter().enumerate().map(|(index, task)| (task.id.as_str(), (index, task))).collect();
         let mut ids = HashSet::new();
         for (position, task) in plan.tasks.iter_mut().enumerate() {
@@ -340,6 +350,56 @@ mod tests {
         assert!(plan.tasks[0].running);
         assert_eq!(plan.tasks.iter().map(|task| &task.id).collect::<HashSet<_>>().len(), 49);
         assert!(plan.tasks[1..].iter().all(|task| !task.running));
+    }
+
+    #[test]
+    fn task_count_cap_blocks_growth_but_not_shrinking_or_state_changes() {
+        let db = Database::new();
+        db.store.update_at(1000, DAY, 0, |plan| {
+            for index in 0..MAX_TASKS_PER_DAY {
+                plan.tasks.push(Task { id: format!("t{index}"), title: format!("t{index}"), ..Task::default() });
+            }
+            Ok(())
+        }).unwrap();
+        assert_eq!(db.store.load_at(2000, DAY, 0).unwrap().tasks.len(), MAX_TASKS_PER_DAY);
+        // Growing past the cap is rejected and leaves the plan untouched.
+        assert!(db.store.update_at(3000, DAY, 0, |plan| {
+            plan.tasks.push(task("overflow", false));
+            Ok(())
+        }).is_err());
+        assert_eq!(db.store.load_at(4000, DAY, 0).unwrap().tasks.len(), MAX_TASKS_PER_DAY);
+        // State changes at the cap still work.
+        db.store.update_at(5000, DAY, 0, |plan| { plan.tasks[0].done = true; Ok(()) }).unwrap();
+        // Shrinking works, and growth is allowed again below the cap.
+        db.store.update_at(6000, DAY, 0, |plan| { plan.tasks.remove(1); Ok(()) }).unwrap();
+        db.store.update_at(7000, DAY, 0, |plan| { plan.tasks.push(task("backfill", false)); Ok(()) }).unwrap();
+        assert_eq!(db.store.load_at(8000, DAY, 0).unwrap().tasks.len(), MAX_TASKS_PER_DAY);
+    }
+
+    #[test]
+    fn over_cap_existing_plan_can_still_shrink_and_complete() {
+        // A plan stored before the cap existed (seeded directly in SQL)
+        // must not become unusable: completing and removing still work,
+        // only further growth is blocked.
+        let db = Database::new();
+        {
+            let conn = db.store.connect().unwrap();
+            for index in 0..(MAX_TASKS_PER_DAY + 1) {
+                conn.execute(
+                    "INSERT INTO tasks (id, plan_date, title, position, state, timer_mode, est_min, elapsed_ms)
+                     VALUES (?1, ?2, ?3, ?4, 'pending', 'up', 0, 0)",
+                    rusqlite::params![format!("old{index}"), DAY, format!("old{index}"), index as i64],
+                ).unwrap();
+            }
+        }
+        assert_eq!(db.store.load_at(1000, DAY, 0).unwrap().tasks.len(), MAX_TASKS_PER_DAY + 1);
+        db.store.update_at(2000, DAY, 0, |plan| { plan.tasks[0].done = true; Ok(()) }).unwrap();
+        assert!(db.store.update_at(3000, DAY, 0, |plan| {
+            plan.tasks.push(task("overflow", false));
+            Ok(())
+        }).is_err());
+        db.store.update_at(4000, DAY, 0, |plan| { plan.tasks.remove(1); Ok(()) }).unwrap();
+        assert_eq!(db.store.load_at(5000, DAY, 0).unwrap().tasks.len(), MAX_TASKS_PER_DAY);
     }
 
     #[test]
