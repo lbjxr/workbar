@@ -589,11 +589,24 @@ fn toggle_bar(app: &AppHandle) {
 
 fn spawn_plan_watcher(app: AppHandle) {
     std::thread::spawn(move || {
+        // Notify only when the plan may have changed, instead of forcing
+        // a full SQLite load in the renderer every 800ms. The fingerprint
+        // is a stat-only check (no database open); see
+        // `workbar_core::database_fingerprint` for why the main file plus
+        // its WAL file are both needed. A 10s safety net bounds any
+        // fingerprint miss to one stale interval, and a false positive
+        // costs nothing because the renderer dedupes identical snapshots.
+        // Idle cost drops from ~75 loads/minute to ~6, plus one per change.
+        let mut last = workbar_core::database_fingerprint();
+        let mut last_emit = std::time::Instant::now();
         loop {
             std::thread::sleep(Duration::from_millis(800));
-            // Poll through the storage API: WAL commits need not change the
-            // main database file's mtime. This also recovers missed events.
-            let _ = app.emit("plan-changed", ());
+            let current = workbar_core::database_fingerprint();
+            if current != last || last_emit.elapsed() >= Duration::from_secs(10) {
+                last = current;
+                last_emit = std::time::Instant::now();
+                let _ = app.emit("plan-changed", ());
+            }
         }
     });
 }

@@ -153,6 +153,40 @@ pub fn database_path() -> PathBuf {
     data_dir().join("workbar.db")
 }
 
+/// Cheap change signal for the desktop plan watcher: the database file
+/// plus its WAL file, each as (last-modified time, size), or `None` when
+/// the file does not exist yet.
+///
+/// A WAL commit may not change the main file's mtime, so the main file
+/// alone is not a reliable signal — but a commit always appends to the
+/// WAL (changing its size or mtime) until a checkpoint folds it into the
+/// main file (changing the main file's size or mtime) and truncates the
+/// WAL. Checking both files therefore catches commits without opening
+/// SQLite at all. It is a signal, not a proof: a commit that somehow
+/// leaves both tuples untouched is caught by the watcher's periodic
+/// safety-net emit, and a false positive only costs one redundant load
+/// because the renderer dedupes identical snapshots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbFingerprint {
+    main: Option<(SystemTime, u64)>,
+    wal: Option<(SystemTime, u64)>,
+}
+
+fn file_state(path: &PathBuf) -> Option<(SystemTime, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
+}
+
+pub fn database_fingerprint() -> DbFingerprint {
+    let path = database_path();
+    let wal_path = {
+        let mut name = path.as_os_str().to_owned();
+        name.push("-wal");
+        PathBuf::from(name)
+    };
+    DbFingerprint { main: file_state(&path), wal: file_state(&wal_path) }
+}
+
 // ---------------------------------------------------------------------------
 // Time helpers
 // ---------------------------------------------------------------------------
@@ -432,6 +466,39 @@ mod tests {
         normalize_task(&mut task).unwrap();
         assert_eq!(task.est_min, 840);
         assert_eq!(timer_mode(&task), TimerMode::Down);
+    }
+
+    #[test]
+    fn database_fingerprint_changes_when_the_database_changes() {
+        // Point the fingerprint at a scratch directory so the test never
+        // touches a real plan.
+        let directory = std::env::temp_dir().join(format!(
+            "workbar-fingerprint-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let previous = std::env::var_os("WORKBAR_DATA_DIR");
+        std::env::set_var("WORKBAR_DATA_DIR", &directory);
+        let cleanup = |directory: &std::path::PathBuf, previous: &Option<std::ffi::OsString>| {
+            if let Some(value) = previous {
+                std::env::set_var("WORKBAR_DATA_DIR", value);
+            } else {
+                std::env::remove_var("WORKBAR_DATA_DIR");
+            }
+            let _ = std::fs::remove_dir_all(directory);
+        };
+        let before = database_fingerprint();
+        assert_eq!(before, DbFingerprint { main: None, wal: None });
+        std::fs::write(directory.join("workbar.db"), b"one").unwrap();
+        let after_create = database_fingerprint();
+        assert_ne!(after_create, before);
+        assert_eq!(after_create, database_fingerprint());
+        std::fs::write(directory.join("workbar.db"), b"one-two-three").unwrap();
+        assert_ne!(database_fingerprint(), after_create);
+        std::fs::write(directory.join("workbar.db-wal"), b"wal").unwrap();
+        assert_ne!(database_fingerprint(), after_create);
+        cleanup(&directory, &previous);
     }
 
     #[test]

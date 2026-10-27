@@ -995,7 +995,12 @@
   async function boot() {
     wire();
     await loadPlan(true);
-    setInterval(tick, 1000);
+    // In Tauri mode the native 1s clock-tick drives tick(); a second JS
+    // interval would render the same second twice. Keep the JS interval
+    // only as the clock for browser/demo mode, where there is no native
+    // tick (the renderer smoke harness already stubs setInterval and
+    // drives ticks through clock-tick).
+    if (!listen) setInterval(tick, 1000);
   }
 
   boot().catch((err) => {

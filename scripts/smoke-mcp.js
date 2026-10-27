@@ -123,7 +123,7 @@ function independentClient(calls) {
 
     const tools = await request('tools/list', {});
     const names = (tools.result && tools.result.tools ? tools.result.tools : []).map((t) => t.name);
-    check('tools/list has 11 tools including explicit reordering', names.length === 11 && names.includes('workbar_reorder_tasks'), names.join(','));
+    check('tools/list has 12 tools including explicit reordering', names.length === 12 && names.includes('workbar_reorder_tasks') && names.includes('workbar_now'), names.join(','));
 
     const plan = await request('tools/call', {
       name: 'workbar_plan_day',
@@ -142,6 +142,13 @@ function independentClient(calls) {
 
     const taskId = dataOf(got).tasks[0]?.id;
     check('get_today exposes ids', !!taskId, taskId || 'none');
+
+    const now = await request('tools/call', { name: 'workbar_now', arguments: {} });
+    const nowData = dataOf(now);
+    check('workbar_now returns local time and per-task state without picking a current task',
+      /^\d{2}:\d{2}$/.test(nowData.now) && typeof nowData.weekday === 'string' && nowData.tasks.length === 2
+      && nowData.tasks.every((task) => typeof task.remaining_sec === 'number' || task.remaining_sec === null)
+      && !('current_task' in nowData) && !('current_id' in nowData), JSON.stringify(nowData).slice(0, 200));
 
     if (taskId) {
       const add = await request('tools/call', {

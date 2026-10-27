@@ -78,11 +78,17 @@
 
 **待定**：点标题打开还是单独图标；默认打开偏好（浏览器 / 文件夹）；是否展示 source。
 
-## 4. `workbar_now` 工具（P2）
+## 4. `workbar_now` 工具（✅ 已实现，2026-10-28）
 
 - MCP 增加 `workbar_now`：返回当前本地时间和各项任务的独立状态（含已用/剩余）。
 - 让 AI 能回答「现在该做什么」和重排当天的计划。
 - 注：`workbar-core` 里已有 `now_minutes()` / `today_weekday()` helper；不再提供默认挑选首项的 `current_task()`。
+
+**最终实现**
+
+- 新工具 `workbar_now`（无参数）：返回 `now`（本地 HH:mm）、`date`、`weekday`，以及每项任务的 `id` / `title` / `timer` / `state`（running / paused / done / pending）/ `spent_sec` / `est_min` / 起止时间 / `remaining_sec`（倒计时任务为 `est_min*60 - spent_sec`，超时为负；正计时任务为 null）。
+- 不返回任何默认首项或 `current_task` / `current_id` 字段；由 AI 自行判断。
+- MCP `instructions` 第 1 条补充：问“现在”相关问题时用 `workbar_now` 而不用 `workbar_get_today`。
 
 ## 5. 已有但未做的 Roadmap 项
 

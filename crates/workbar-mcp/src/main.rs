@@ -151,7 +151,7 @@ fn initialize_result(params: &Value) -> Value {
         "instructions": "WorkBar is the user's always-on-top floating work bar on Windows. Each task has its own independent timer and state; no task has priority because of its position or a current-task marker. The bar is the single source of truth for today's plan. \
 \n\nWhen to call tools (do it proactively, do not just print a plan in chat): whenever the user talks about today's plan, their tasks, what to do next, finishing something, moving/renaming a task, or asks for a schedule. \
 \n\nWorkflow rules:\n\
-1. Call workbar_get_today before reading or editing so you reuse existing task ids and see which task the bar is showing.\n\
+1. Call workbar_get_today before reading or editing so you reuse existing task ids and see which task the bar is showing. For questions about right now — what to do next, whether a task is overdue — call workbar_now instead; it returns the current local time with each task's state.\n\
 2. workbar_plan_day replaces the whole day — use it only when starting or fully re-planning the day.\n\
 3. Queue order is stable: workbar_add_tasks appends in supplied order; editing times or timer states never reorders tasks. Only when explicitly requested, use position='first'/'last' or after_id on add/update, or workbar_reorder_tasks with task_ids / by='start_time'. Prefer these over re-creating the day.\n\
 4. Times are local HH:mm (24h). One task = one short piece of work; titles must be short (<= 14 Chinese chars / ~40 latin chars) because the bar is tiny; prefer 3-8 tasks per day. A task with an estimate or a time window counts down against it; a task with neither is an open-ended stopwatch (timer 'up', ring laps once per hour).\n\
@@ -216,6 +216,12 @@ fn tool_definitions() -> Vec<Value> {
             "name": "workbar_get_today",
             "title": "Read today's WorkBar plan",
             "description": "Read the user's current day plan: tasks, ids, time windows, estimates, and how much time was actually spent. Call this first before editing. If you are about to do a job for the user, call workbar_start_work first so the bar shows it.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        }),
+        json!({
+            "name": "workbar_now",
+            "title": "What time is it and what is each task's state right now",
+            "description": "Return the current local time, date, and weekday, plus every task's independent timer state: spent seconds and, for countdown tasks, remaining seconds (negative when overdue). Does not pick a current task — no task has priority because of its position. Use this when the user asks what to do now, whether something is overdue, or to re-plan the day, instead of workbar_get_today.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         }),
         json!({
@@ -377,6 +383,7 @@ fn call_tool(params: &Value) -> Result<Value, RpcError> {
 
     match name {
         "workbar_get_today" => Ok(tool_get_today(&args)),
+        "workbar_now" => Ok(tool_now()),
         "workbar_plan_day" => Ok(tool_plan_day(&args)),
         "workbar_add_tasks" => Ok(tool_add_tasks(&args)),
         "workbar_update_task" => Ok(tool_update_task(&args)),
@@ -466,6 +473,56 @@ fn validate_new_task(task: &Task, index: usize) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Remaining seconds for a countdown task (negative when overdue);
+/// stopwatch tasks have no target, so there is no remaining time.
+fn remaining_sec(task: &Task) -> Option<i64> {
+    if workbar_core::timer_mode(task) == TimerMode::Up {
+        None
+    } else {
+        Some(task.est_min as i64 * 60 - task.spent_sec as i64)
+    }
+}
+
+fn task_state(task: &Task) -> &'static str {
+    if task.done {
+        "done"
+    } else if task.running {
+        "running"
+    } else if task.paused || task.spent_sec > 0 {
+        "paused"
+    } else {
+        "pending"
+    }
+}
+
+fn tool_now() -> Value {
+    match workbar_core::load() {
+        Ok(plan) => text_result(
+            json!({
+                "now": workbar_core::now_hhmm(),
+                "date": plan.date,
+                "weekday": workbar_core::today_weekday(),
+                "tasks": plan.tasks.iter().map(|task| json!({
+                    "id": task.id,
+                    "title": task.title,
+                    "timer": workbar_core::timer_mode(task),
+                    "state": task_state(task),
+                    "running": task.running,
+                    "paused": task.paused,
+                    "done": task.done,
+                    "spent_sec": task.spent_sec,
+                    "est_min": task.est_min,
+                    "start": task.start,
+                    "end": task.end,
+                    "remaining_sec": remaining_sec(task),
+                })).collect::<Vec<_>>(),
+            })
+            .to_string(),
+        ),
+        Err(err) => error_result(err),
+    }
 }
 
 fn parse_tasks(value: &Value) -> Result<Vec<Task>, String> {
@@ -973,6 +1030,30 @@ mod tests {
         assert_eq!(tool_finish_work(&json!({}))["isError"], true);
         let plan = workbar_core::load().unwrap();
         assert_eq!(plan.tasks.iter().filter(|task| task.source.as_deref() == Some("independence-test") && !task.done).count(), 2);
+    }
+
+    #[test]
+    fn now_remaining_time_is_negative_when_overdue_and_absent_for_stopwatches() {
+        let countdown = Task {
+            title: "down".into(),
+            timer: Some(TimerMode::Down),
+            est_min: 30,
+            spent_sec: 2000,
+            running: true,
+            ..Task::default()
+        };
+        assert_eq!(remaining_sec(&countdown), Some(-200));
+        assert_eq!(task_state(&countdown), "running");
+        let stopwatch = Task {
+            title: "up".into(),
+            timer: Some(TimerMode::Up),
+            spent_sec: 500,
+            ..Task::default()
+        };
+        assert_eq!(remaining_sec(&stopwatch), None);
+        assert_eq!(task_state(&stopwatch), "paused");
+        let pending = Task { title: "todo".into(), ..Task::default() };
+        assert_eq!(task_state(&pending), "pending");
     }
 
     #[test]
