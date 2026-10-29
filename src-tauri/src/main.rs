@@ -7,12 +7,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod shortcut_settings;
+mod language;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, TryLockError};
 use std::time::Duration;
 use tauri::{
-    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewWindow, WindowEvent,
 };
@@ -337,7 +338,7 @@ fn apply_content_region(window: &WebviewWindow, collapsed: bool) -> Result<(), S
 /// Tao keeps WS_CAPTION even for undecorated top-level windows, hiding it via
 /// WM_NCCALCSIZE. SetWindowRgn exposes its classic non-client painting on some
 /// systems. Remove the frame styles themselves, including when Tao rewrites
-/// them during show/hide, instead of covering the resulting caption strip.
+/// them during show/hide, and suppress non-client painting on activation.
 #[cfg(windows)]
 fn configure_overlay_frame(hwnd: windows::Win32::Foundation::HWND) -> Result<(), String> {
     use windows::Win32::Foundation::{GetLastError, SetLastError, WIN32_ERROR};
@@ -408,9 +409,20 @@ unsafe extern "system" fn overlay_frame_proc(
     use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
     use windows::Win32::UI::WindowsAndMessaging::{
         STYLESTRUCT, WINDOWPOS, WM_STYLECHANGING, WM_WINDOWPOSCHANGING, WM_NCDESTROY,
+        WM_NCACTIVATE, WM_NCPAINT,
         HWND_TOPMOST, SWP_NOZORDER, SWP_SHOWWINDOW, SWP_NOACTIVATE,
     };
-    if message == WM_STYLECHANGING && lparam.0 != 0 {
+    if message == WM_NCPAINT {
+        // The overlay's entire surface belongs to WebView2. In particular,
+        // opening the tray menu for the first time must not paint a native
+        // caption over the transparent pixels inside our window region.
+        return windows::Win32::Foundation::LRESULT(0);
+    } else if message == WM_NCACTIVATE {
+        // Preserve Tao's activation bookkeeping, but tell DefWindowProc not
+        // to repaint the frame (documented WM_NCACTIVATE lParam = -1).
+        // Clearing WS_CAPTION alone does not suppress this redraw path.
+        return DefSubclassProc(hwnd, message, wparam, windows::Win32::Foundation::LPARAM(-1));
+    } else if message == WM_STYLECHANGING && lparam.0 != 0 {
         let styles = &mut *(lparam.0 as *mut STYLESTRUCT);
         styles.styleNew = overlay_style(wparam.0 as i32, styles.styleNew);
     } else if message == WM_WINDOWPOSCHANGING && lparam.0 != 0 {
@@ -733,18 +745,27 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let autostart_item = CheckMenuItem::with_id(
         app,
         "autostart",
-        "开机自启",
+        language::text(app.handle(), "tray.autostart"),
         true,
         autostart_enabled,
         None::<&str>,
     )?;
     let autostart_for_handler = autostart_item.clone();
 
-    let show_item = MenuItem::with_id(app, "show", format!("收起 / 展开  ({})", shortcut_settings::DEFAULT_SHORTCUT), true, None::<&str>)?;
+    let show_item = MenuItem::with_id(app, "show", format!("{}  ({})", language::text(app.handle(), "tray.toggle"), shortcut_settings::DEFAULT_SHORTCUT), true, None::<&str>)?;
     shortcut_settings::attach_menu(app.handle(), show_item.clone());
-    let shortcut_item = MenuItem::with_id(app, "shortcut", "设置快捷键…", true, None::<&str>)?;
-    let data_item = MenuItem::with_id(app, "data", "打开数据目录", true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app, "quit", "退出 WorkBar", true, None::<&str>)?;
+    let shortcut_item = MenuItem::with_id(app, "shortcut", language::text(app.handle(), "tray.shortcut"), true, None::<&str>)?;
+    let data_item = MenuItem::with_id(app, "data", language::text(app.handle(), "tray.data"), true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", language::text(app.handle(), "tray.quit"), true, None::<&str>)?;
+
+    let system = CheckMenuItem::with_id(app, "language-system", language::text(app.handle(), "language.system"), true, false, None::<&str>)?;
+    let chinese = CheckMenuItem::with_id(app, "language-zh", "简体中文", true, false, None::<&str>)?;
+    let english = CheckMenuItem::with_id(app, "language-en", "English", true, false, None::<&str>)?;
+    let language_menu = Submenu::with_items(app, language::text(app.handle(), "tray.language"), true, &[&system, &chinese, &english])?;
+    language::attach_menu(app.handle(), language::TrayLabels {
+        shortcut: shortcut_item.clone(), autostart: autostart_item.clone(), data: data_item.clone(), quit: quit_item.clone(),
+        language: language_menu.clone(), system, chinese, english,
+    });
 
     let menu = Menu::with_items(
         app,
@@ -752,6 +773,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
             &show_item,
             &shortcut_item,
             &autostart_item,
+            &language_menu,
             &data_item,
             &PredefinedMenuItem::separator(app)?,
             &quit_item,
@@ -765,6 +787,9 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "show" => toggle_bar(app),
             "shortcut" => shortcut_settings::open(app),
+            "language-system" => language::select(app, language::Preference::System),
+            "language-zh" => language::select(app, language::Preference::Chinese),
+            "language-en" => language::select(app, language::Preference::English),
             "data" => {
                 let _ = open_data_dir();
             }
@@ -823,6 +848,7 @@ fn main() {
             content_width: AtomicU32::new(0),
             operation: Mutex::new(()),
         })
+        .manage(language::LanguageState::load())
         .manage(shortcut_settings::SettingsState::default())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -847,6 +873,7 @@ fn main() {
             open_data_dir,
             app_info,
             trace_js,
+            language::get_language,
             shortcut_settings::get_shortcut,
             shortcut_settings::save_shortcut,
             shortcut_settings::set_shortcut_recording,
@@ -908,6 +935,56 @@ fn main() {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn tray_activation_never_requests_native_frame_painting() {
+        use windows::core::w;
+        use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+        use windows::Win32::UI::WindowsAndMessaging::*;
+
+        #[derive(Default)]
+        struct PaintProbe { paints: usize, activations: Vec<usize> }
+        unsafe extern "system" fn probe(
+            hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, data: usize,
+        ) -> LRESULT {
+            let probe = &mut *(data as *mut PaintProbe);
+            if message == WM_NCPAINT || (message == WM_NCACTIVATE && lparam.0 != -1) {
+                probe.paints += 1;
+            }
+            if message == WM_NCACTIVATE { probe.activations.push(wparam.0); }
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        }
+        struct TestWindow(HWND);
+        impl Drop for TestWindow { fn drop(&mut self) { unsafe { let _ = DestroyWindow(self.0); } } }
+        unsafe {
+            let mut paint = Box::<PaintProbe>::default();
+            // Match Tao's initially captioned top-level window. The probe
+            // stands below our subclass, where Tao/DefWindowProc would paint.
+            let window = TestWindow(CreateWindowExW(WS_EX_WINDOWEDGE, w!("STATIC"), w!("Workbar activation test"),
+                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, -10000, -10000, 1094, 73, None, None, None, None).unwrap());
+            assert!(SetWindowSubclass(window.0, Some(probe), 1, &mut *paint as *mut PaintProbe as usize).as_bool());
+            configure_overlay_frame(window.0).unwrap();
+            set_content_region(window.0, PhysicalSize::new(1094, 73), Some(310)).unwrap();
+            paint.paints = 0;
+            paint.activations.clear();
+            let foreground = GetForegroundWindow();
+            // Menu ownership changes activation even though the bar itself
+            // never takes focus. Exercise first use, repeated use and redraws.
+            for _ in 0..3 {
+                for active in [1, 0] {
+                    let result = SendMessageW(window.0, WM_NCACTIVATE, WPARAM(active), LPARAM(0));
+                    if active == 0 { assert_ne!(result.0, 0, "deactivation must still be accepted"); }
+                    SendMessageW(window.0, WM_NCPAINT, WPARAM(1), LPARAM(0));
+                }
+            }
+            assert_eq!(paint.paints, 0, "native painting would overwrite WebView2's transparent surface");
+            assert_eq!(paint.activations, [1, 0, 1, 0, 1, 0], "activation bookkeeping must still reach the framework");
+            assert_eq!(GetForegroundWindow(), foreground);
+            assert_eq!(GetWindowLongPtrW(window.0, GWL_STYLE) as u32 & WS_CAPTION.0, 0);
+        }
+    }
 
     #[cfg(windows)]
     #[test]
