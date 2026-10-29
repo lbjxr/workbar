@@ -243,10 +243,12 @@ fn display_info(window: &WebviewWindow) -> Option<DisplayInfo> {
         .ok()
         .flatten()
         .or_else(|| window.primary_monitor().ok().flatten())?;
+    // Tauri's Monitor::size()/position() return references, but DisplayInfo
+    // owns its values (it outlives the monitor query), so copy them out.
     Some(DisplayInfo {
         scale,
-        screen: monitor.size(),
-        origin: monitor.position(),
+        screen: *monitor.size(),
+        origin: *monitor.position(),
     })
 }
 
@@ -276,7 +278,10 @@ fn bar_geometry_for(
 
     // A task-count change must not resize WebView2's backing surface after the
     // CSS contraction: that late surface resize caused a visible flash. On
-    // Windows retain a stable canvas and trim the native window region instead.
+    // Windows retain a stable canvas and trim the native window region instead,
+    // so task_count is intentionally unused there.
+    #[cfg(windows)]
+    let _ = task_count;
     #[cfg(windows)]
     let logical_width = expanded_width_limit_for(info.screen.width as f64, info.scale);
     #[cfg(not(windows))]
@@ -284,7 +289,7 @@ fn bar_geometry_for(
     let width = (logical_width * info.scale).round() as u32;
     let height = ((TOP_MARGIN + PILL_HEIGHT + BOTTOM_MARGIN) * info.scale).round() as u32;
     let x = info.origin.x + ((info.screen.width as i64 - width as i64) / 2) as i32;
-    (PhysicalSize::new(width, height), PhysicalPosition::new(info.origin.x, info.origin.y))
+    (PhysicalSize::new(width, height), PhysicalPosition::new(x, info.origin.y))
 }
 
 /// Compute the window geometry (size + position) for a bar state.
@@ -1199,6 +1204,27 @@ mod layout_tests {
             (
                 PhysicalSize::new(2560, 5),
                 PhysicalPosition::new(0, 0)
+            )
+        );
+        // Expanded bar must be centered, not left-aligned at the monitor
+        // origin. Windows keeps the stable limit canvas (1094 logical ->
+        // 1368 physical, x = (2560 - 1368) / 2 = 596); elsewhere the width
+        // follows the task count (310 logical -> 388 physical, x = 1086).
+        // Height is (3 + 64 + 6) * 1.25 = 91.25 -> 91 on both.
+        #[cfg(windows)]
+        assert_eq!(
+            bar_geometry_for(false, 1, &info),
+            (
+                PhysicalSize::new(1368, 91),
+                PhysicalPosition::new(596, 0)
+            )
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            bar_geometry_for(false, 1, &info),
+            (
+                PhysicalSize::new(388, 91),
+                PhysicalPosition::new(1086, 0)
             )
         );
     }
