@@ -206,12 +206,85 @@ fn expanded_layout(task_count: usize, max_width: f64) -> (f64, usize) {
     (capacity as f64 * CARD_WIDTH + BROWSE_CHROME, capacity)
 }
 
-fn expanded_width_limit(window: &WebviewWindow) -> Option<f64> {
-    let scale = window.scale_factor().ok()?;
-    let monitor = window.primary_monitor().ok().flatten()?;
-    Some((monitor.size().width as f64 / scale - 120.0)
+/// Logical width limit for the bar on a monitor, from its physical width
+/// and scale factor. Pure so it can be unit-tested without a window.
+fn expanded_width_limit_for(monitor_width: f64, scale: f64) -> f64 {
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    (monitor_width / scale - 120.0)
         .max(CARD_WIDTH + BROWSE_CHROME)
-        .min(MAX_CARDS as f64 * CARD_WIDTH + BROWSE_CHROME))
+        .min(MAX_CARDS as f64 * CARD_WIDTH + BROWSE_CHROME)
+}
+
+fn expanded_width_limit(window: &WebviewWindow) -> Option<f64> {
+    let info = display_info(window)?;
+    Some(expanded_width_limit_for(info.screen.width as f64, info.scale))
+}
+
+/// Display info captured while the window is on-screen. Geometry must never
+/// be recomputed from a hidden or off-screen window: Tao may report a wrong
+/// scale factor (or none) for such a window, and the bar then comes back at
+/// the wrong size — on a 125% display a scale read as 1.0 shrinks everything
+/// to 80%. The monitor is the one the window is actually on, not always the
+/// primary one, so a bar on a second display with a different scale is sized
+/// for that display.
+struct DisplayInfo {
+    scale: f64,
+    screen: PhysicalSize<u32>,
+    origin: PhysicalPosition<i32>,
+}
+
+fn display_info(window: &WebviewWindow) -> Option<DisplayInfo> {
+    let scale = window.scale_factor().ok()?;
+    if !(scale > 0.0) {
+        return None;
+    }
+    let monitor = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.primary_monitor().ok().flatten())?;
+    Some(DisplayInfo {
+        scale,
+        screen: monitor.size(),
+        origin: monitor.position(),
+    })
+}
+
+/// Visible content width in physical pixels for a task count. Pure so the
+/// scale arithmetic can be unit-tested without a window.
+fn content_width_for(task_count: usize, limit: f64, scale: f64) -> u32 {
+    let (width, _) = expanded_layout(task_count, limit);
+    (width * scale).round() as u32
+}
+
+/// Pure window geometry for a bar state, given display info captured
+/// on-screen. Callers that resize while hidden or parked off-screen must
+/// pass info captured before the hide/park, never re-query it mid-move.
+fn bar_geometry_for(
+    collapsed: bool,
+    task_count: usize,
+    info: &DisplayInfo,
+) -> (PhysicalSize<u32>, PhysicalPosition<i32>) {
+    // Collapsed: a full-width line flush with the top edge of the screen.
+    if collapsed {
+        let height = (LINE_HEIGHT * info.scale).round().max(2.0) as u32;
+        return (
+            PhysicalSize::new(info.screen.width, height),
+            PhysicalPosition::new(info.origin.x, info.origin.y),
+        );
+    }
+
+    // A task-count change must not resize WebView2's backing surface after the
+    // CSS contraction: that late surface resize caused a visible flash. On
+    // Windows retain a stable canvas and trim the native window region instead.
+    #[cfg(windows)]
+    let logical_width = expanded_width_limit_for(info.screen.width as f64, info.scale);
+    #[cfg(not(windows))]
+    let logical_width = expanded_layout(task_count, expanded_width_limit_for(info.screen.width as f64, info.scale)).0;
+    let width = (logical_width * info.scale).round() as u32;
+    let height = ((TOP_MARGIN + PILL_HEIGHT + BOTTOM_MARGIN) * info.scale).round() as u32;
+    let x = info.origin.x + ((info.screen.width as i64 - width as i64) / 2) as i32;
+    (PhysicalSize::new(width, height), PhysicalPosition::new(info.origin.x, info.origin.y))
 }
 
 /// Compute the window geometry (size + position) for a bar state.
@@ -219,32 +292,13 @@ fn bar_geometry(
     window: &WebviewWindow,
     collapsed: bool,
 ) -> Option<(PhysicalSize<u32>, PhysicalPosition<i32>)> {
-    let scale = window.scale_factor().ok()?;
-    let monitor = window.primary_monitor().ok().flatten()?;
-    let screen = monitor.size();
-    let origin = monitor.position();
-
-    // Collapsed: a full-width line flush with the top edge of the screen.
-    if collapsed {
-        let height = (LINE_HEIGHT * scale).round().max(2.0) as u32;
-        return Some((PhysicalSize::new(screen.width, height), PhysicalPosition::new(origin.x, origin.y)));
-    }
-
-    // A task-count change must not resize WebView2's backing surface after the
-    // CSS contraction: that late surface resize caused a visible flash. On
-    // Windows retain a stable canvas and trim the native window region instead.
-    #[cfg(windows)]
-    let logical_width = expanded_width_limit(window)?;
-    #[cfg(not(windows))]
-    let logical_width = {
-        let count = window.app_handle().state::<BarState>().task_count.load(Ordering::SeqCst);
-        let (logical_width, _) = expanded_layout(count, expanded_width_limit(window)?);
-        logical_width
-    };
-    let width = (logical_width * scale).round() as u32;
-    let height = ((TOP_MARGIN + PILL_HEIGHT + BOTTOM_MARGIN) * scale).round() as u32;
-    let x = origin.x + ((screen.width as i64 - width as i64) / 2) as i32;
-    Some((PhysicalSize::new(width, height), PhysicalPosition::new(x, origin.y)))
+    let info = display_info(window)?;
+    let count = window
+        .app_handle()
+        .state::<BarState>()
+        .task_count
+        .load(Ordering::SeqCst);
+    Some(bar_geometry_for(collapsed, count, &info))
 }
 
 /// A parking spot fully outside every connected monitor. Deliberately NOT
@@ -275,15 +329,39 @@ fn offscreen_park(window: &WebviewWindow) -> PhysicalPosition<i32> {
     }
 }
 
-/// Horizontal pill centered at the top of the primary monitor.
-fn place(window: &WebviewWindow, collapsed: bool) {
-    if let Some((size, position)) = bar_geometry(window, collapsed) {
-        let _ = window.set_size(size);
-        let _ = window.set_position(position);
-        if let Err(error) = apply_content_region(window, collapsed) {
-            trace(&format!("fit region failed: {error}"));
-        }
+/// Horizontal pill centered at the top of the monitor the window is on.
+/// The size/position/region here come from display info captured on-screen,
+/// so a caller that hid or parked the window first must pass info captured
+/// before that move (see `place_with`), not re-query it mid-move.
+fn place_with(
+    window: &WebviewWindow,
+    collapsed: bool,
+    size: PhysicalSize<u32>,
+    position: PhysicalPosition<i32>,
+    info: &DisplayInfo,
+) {
+    trace(&format!(
+        "place collapsed={collapsed} scale={} size={}x{} pos={},{}",
+        info.scale, size.width, size.height, position.x, position.y
+    ));
+    let _ = window.set_size(size);
+    let _ = window.set_position(position);
+    if let Err(error) = apply_content_region_for(window, collapsed, size, info) {
+        trace(&format!("fit region failed: {error}"));
     }
+}
+
+fn place(window: &WebviewWindow, collapsed: bool) {
+    let Some(info) = display_info(window) else {
+        return;
+    };
+    let count = window
+        .app_handle()
+        .state::<BarState>()
+        .task_count
+        .load(Ordering::SeqCst);
+    let (size, position) = bar_geometry_for(collapsed, count, &info);
+    place_with(window, collapsed, size, position, &info);
 }
 
 #[cfg(windows)]
@@ -318,13 +396,22 @@ fn centered_content_bounds(canvas_width: u32, content_width: u32) -> (i32, i32) 
     (left as i32, (left + width) as i32)
 }
 
-fn apply_content_region(window: &WebviewWindow, collapsed: bool) -> Result<(), String> {
-    let canvas = window.inner_size().map_err(|error| error.to_string())?;
+fn apply_content_region_for(
+    window: &WebviewWindow,
+    collapsed: bool,
+    canvas: PhysicalSize<u32>,
+    info: &DisplayInfo,
+) -> Result<(), String> {
     let state = window.app_handle().state::<BarState>();
-    let width = if collapsed { canvas.width } else {
+    let width = if collapsed {
+        canvas.width
+    } else {
         let count = state.task_count.load(Ordering::SeqCst);
-        let (width, _) = expanded_layout(count, expanded_width_limit(window).ok_or("无法读取屏幕尺寸")?);
-        (width * window.scale_factor().map_err(|error| error.to_string())?).round() as u32
+        content_width_for(
+            count,
+            expanded_width_limit_for(info.screen.width as f64, info.scale),
+            info.scale,
+        )
     };
     #[cfg(windows)]
     {
@@ -333,6 +420,12 @@ fn apply_content_region(window: &WebviewWindow, collapsed: bool) -> Result<(), S
     }
     state.content_width.store(width.min(canvas.width), Ordering::SeqCst);
     Ok(())
+}
+
+fn apply_content_region(window: &WebviewWindow, collapsed: bool) -> Result<(), String> {
+    let canvas = window.inner_size().map_err(|error| error.to_string())?;
+    let info = display_info(window).ok_or("无法读取显示器缩放")?;
+    apply_content_region_for(window, collapsed, canvas, &info)
 }
 
 /// Tao keeps WS_CAPTION even for undecorated top-level windows, hiding it via
@@ -469,7 +562,16 @@ fn apply_bar_state_later(app: AppHandle, requested: bool) {
         }
         let Some(window) = app.get_webview_window("main") else { return; };
         trace(&format!("apply {desired} start revision={revision}"));
-        if let Some((size, position)) = bar_geometry(&window, desired) {
+        // Capture display info BEFORE parking: a window parked off-screen
+        // is on no monitor, so a scale factor read there may come back as
+        // 1.0 and the content region (and the bar itself) would come back
+        // shrunken on a scaled display. Nothing below re-queries the scale.
+        if let Some(info) = display_info(&window) {
+            let (size, position) = bar_geometry_for(
+                desired,
+                state.task_count.load(Ordering::SeqCst),
+                &info,
+            );
             // Park the window off-screen for the resize. Resizing a visible
             // transparent WebView2 window paints a black band for a few
             // frames, while hiding the HWND makes WebView2 suspend the
@@ -483,13 +585,17 @@ fn apply_bar_state_later(app: AppHandle, requested: bool) {
             // Re-assert a fully transparent backdrop after the resize,
             // otherwise some WebView2 versions keep the opaque band.
             let _ = window.set_background_color(Some(tauri::utils::config::Color(0, 0, 0, 0)));
-            if let Err(error) = apply_content_region(&window, desired) {
+            if let Err(error) = apply_content_region_for(&window, desired, size, &info) {
                 trace(&format!("fit region failed: {error}"));
             }
             // Give WebView2 a moment to repaint at the new size while the
             // band frames land off-screen, then return to the final spot.
             std::thread::sleep(Duration::from_millis(60));
             let _ = window.set_position(position);
+            // Re-assert the same geometry once back on-screen, so both the
+            // native size/region and WebView2's DPI context are refreshed
+            // from an on-screen window instead of the parked one.
+            place_with(&window, desired, size, position, &info);
         }
         keep_overlay_on_top(&window);
         state.applied.store(desired, Ordering::SeqCst);
@@ -548,8 +654,11 @@ fn queue_content_width(app: AppHandle, revision: u64) {
         if moved {
             if let Err(error) = window.set_position(position) { trace(&format!("fit position failed: {error}")); return; }
         }
-        let (width, _) = expanded_layout(state.task_count.load(Ordering::SeqCst), expanded_width_limit(&window).unwrap_or(CARD_WIDTH + BROWSE_CHROME));
-        let width = (width * window.scale_factor().unwrap_or(1.0)).round() as u32;
+        let width = content_width_for(
+            state.task_count.load(Ordering::SeqCst),
+            expanded_width_limit(&window).unwrap_or(CARD_WIDTH + BROWSE_CHROME),
+            window.scale_factor().unwrap_or(1.0),
+        );
         if canvas_changed || moved || state.content_width.load(Ordering::SeqCst) != width {
             if let Err(error) = apply_content_region(&window, false) { trace(&format!("fit region failed: {error}")); }
             else { trace(&format!("fit region done count={} content_width={} canvas_width={}", state.task_count.load(Ordering::SeqCst), width, size.width)); }
@@ -563,10 +672,24 @@ fn set_bar_state(app: &AppHandle, window: &WebviewWindow, collapsed: bool) {
     state.collapsed.store(collapsed, Ordering::SeqCst);
     state.applied.store(collapsed, Ordering::SeqCst);
     state.revision.fetch_add(1, Ordering::SeqCst);
+    // Capture display info BEFORE hiding: a hidden window may report a
+    // wrong scale factor, and geometry computed from it would shrink the
+    // bar when it comes back (seen on 125% displays after collapse/expand).
     // Resize while hidden: avoids the clipped/stale frames you get when a
     // transparent window is resized mid-animation.
+    let info = display_info(window);
     let _ = window.hide();
-    place(window, collapsed);
+    match info {
+        Some(info) => {
+            let (size, position) = bar_geometry_for(
+                collapsed,
+                state.task_count.load(Ordering::SeqCst),
+                &info,
+            );
+            place_with(window, collapsed, size, position, &info);
+        }
+        None => place(window, collapsed),
+    }
     // Re-assert a fully transparent backdrop after the resize, otherwise some
     // WebView2 versions paint the resized surface with an opaque black band.
     let _ = window.set_background_color(Some(tauri::utils::config::Color(0, 0, 0, 0)));
@@ -925,6 +1048,24 @@ fn main() {
                 api.prevent_close();
                 let _ = window.hide();
             }
+            // The bar previously never reacted to a DPI change at all: a
+            // scale change (or a move to a display with another scale) left
+            // the old physical size in place until the next task-count
+            // change. Re-place from the current collapsed state instead.
+            if let WindowEvent::ScaleFactorChanged { scale_factor, .. } = event {
+                trace(&format!(
+                    "scale factor changed label={} scale={scale_factor}",
+                    window.label()
+                ));
+                let app = window.app_handle();
+                let collapsed = app
+                    .state::<BarState>()
+                    .collapsed
+                    .load(Ordering::SeqCst);
+                if let Some(main) = app.get_webview_window("main") {
+                    place(&main, collapsed);
+                }
+            }
         })
         .run(tauri::generate_context!())
         .inspect_err(|error| log_boot(&format!("event loop exited with error: {error}")))
@@ -1034,6 +1175,32 @@ mod layout_tests {
         }
         assert_eq!(expanded_layout(5, 1094.0), (1094.0, 4));
         assert_eq!(expanded_layout(usize::MAX, 1094.0), (1094.0, 4));
+    }
+
+    #[test]
+    fn width_limit_and_content_width_follow_the_monitor_scale() {
+        // 2K display at 125%: 2560 physical px, scale 1.25, capped at the
+        // 4-card canvas width.
+        assert_eq!(expanded_width_limit_for(2560.0, 1.25), 1094.0);
+        assert_eq!(expanded_width_limit_for(1280.0, 1.25), 904.0);
+        assert_eq!(expanded_width_limit_for(800.0, 1.0), 680.0);
+        // One task at 125% must occupy 388 physical px, not the 310 a
+        // scale factor misread as 1.0 would produce (310 * 1.25 = 387.5).
+        assert_eq!(content_width_for(1, 1094.0, 1.25), 388);
+        assert_eq!(content_width_for(1, 1094.0, 1.0), 310);
+        // Collapsed line at 125%: full screen width, 5 physical px tall.
+        let info = DisplayInfo {
+            scale: 1.25,
+            screen: PhysicalSize::new(2560, 1440),
+            origin: PhysicalPosition::new(0, 0),
+        };
+        assert_eq!(
+            bar_geometry_for(true, 1, &info),
+            (
+                PhysicalSize::new(2560, 5),
+                PhysicalPosition::new(0, 0)
+            )
+        );
     }
 
     #[test]

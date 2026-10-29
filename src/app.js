@@ -950,6 +950,11 @@
     el.slim.addEventListener("click", () => expand());
     document.addEventListener("contextmenu", (event) => event.preventDefault());
     window.addEventListener("resize", () => {
+      // Diagnostic: devicePixelRatio is the renderer's own view of the
+      // display scale. If it drops (e.g. 1.25 -> 1) after a collapse/expand
+      // while the native size stays right, the pill shrinks proportionally
+      // even though no native geometry changed.
+      trace(`resize size=${window.innerWidth}x${window.innerHeight} dpr=${window.devicePixelRatio}`);
       // Cleanup only: tall-viewport CSS hides the line even if this is late.
       if (window.innerHeight > 8) el.stage.classList.remove("expanding");
       const count = (plan.tasks || []).filter((task) => !task.done).length;
@@ -962,7 +967,7 @@
     });
     const slimViewport = window.matchMedia("(max-height: 8px)");
     slimViewport.addEventListener("change", () => {
-      const size = `${window.innerWidth}x${window.innerHeight}`;
+      const size = `${window.innerWidth}x${window.innerHeight} dpr=${window.devicePixelRatio}`;
       trace(`viewport slim=${slimViewport.matches} size=${size}`);
       // Diagnostic only: neither visual state waits for this callback.
       requestAnimationFrame(() => trace(`viewport frame size=${size}`));
